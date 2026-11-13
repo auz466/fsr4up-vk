@@ -1,0 +1,12 @@
+# build output, and everything extracted from AMD's DLL (build/gen/)
+/build/
+# traces of AMD's DLL and the port, and anything carved out of the DLL: kept locally only
+/re/
+# AMD's DLLs and the Windows harness, never committed
+*.dll
+*.exe
+/local.env
+__pycache__/
+*.pyc
+# logs written by providers run from here (fsr4-vk writes fsr4.log)
+*.log
