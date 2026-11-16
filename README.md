@@ -10,6 +10,8 @@ This is an independent implementation. It is not AMD's, and AMD does not support
 It drops in where [fsr4-vk](https://github.com/Astyyyyy/fsr4-vk) (FSR 4.1.1, from SDK 2.3.0's DX12 DLL) is used: the
 same file name, `amd_fidelityfx_upscaler_vk.so`, and the same entry points.
 
+Heavily assisted by Claude.
+
 ## Status
 
 - Output **bit-identical to AMD's DLL** (run under Wine on the same GPU) on the regression suite: `tests/against_amd.py`,
