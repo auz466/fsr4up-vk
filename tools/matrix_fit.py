@@ -12,7 +12,9 @@ def split(picks):
     ids = [p[0] for p in picks]
     i = 0
     while ids[i] in EXTRA: i += 1
-    return ids[:i], ids[i], ids[i + 1:i + 26], ids[i + 26], ids[i + 27:]
+    j = len(ids) - 1   # (the postpass: the last pass that is not one of the shared ones)
+    while ids[j] in EXTRA: j -= 1
+    return ids[:i], ids[i], ids[i + 1:j], ids[j], ids[j + 1:]
 bits = [('cf', 2), ('cf', 4), ('cf', 8), ('cf', 32), ('cf', 256), ('cf', 512), ('df', 2), ('df', 4)]
 def key(cf, df, sel): return tuple((cf if s == 'cf' else df) & b for (s, b) in sel)
 for name, idx in [('before', 0), ('prepass', 1), ('model', 2), ('postpass', 3), ('after', 4)]:

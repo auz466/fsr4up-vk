@@ -543,7 +543,7 @@ VkResult VKAPI_CALL SetDebugUtilsObjectNameEXT(VkDevice, const VkDebugUtilsObjec
 void VKAPI_CALL CmdBeginDebugUtilsLabelEXT(VkCommandBuffer, const VkDebugUtilsLabelEXT* l) { logf("LABEL begin %s", l->pLabelName); }
 void VKAPI_CALL CmdEndDebugUtilsLabelEXT(VkCommandBuffer) { logf("LABEL end"); }
 
-void VKAPI_CALL DestroyBuffer(VkDevice d, VkBuffer h, const VkAllocationCallbacks* a) { dead(h), vkDestroyBuffer(d, h, a); }
+void VKAPI_CALL DestroyBuffer(VkDevice d, VkBuffer h, const VkAllocationCallbacks* a) { dead(h), g_buffers.erase(H(h)), vkDestroyBuffer(d, h, a); }   // (gone: not dumped)
 void VKAPI_CALL DestroyImage(VkDevice d, VkImage h, const VkAllocationCallbacks* a) { dead(h), vkDestroyImage(d, h, a); }
 void VKAPI_CALL DestroyImageView(VkDevice d, VkImageView h, const VkAllocationCallbacks* a) { dead(h), vkDestroyImageView(d, h, a); }
 void VKAPI_CALL DestroySampler(VkDevice d, VkSampler h, const VkAllocationCallbacks* a) { dead(h), vkDestroySampler(d, h, a); }
@@ -1098,6 +1098,100 @@ static float envf_list(const char* n, int k, float d) {
     return q && *q ? (float)strtod(q, nullptr) : d;
 }
 
+#ifdef _WIN32
+// ---------------------------------------------------------------- what AMD's DLL learns of the GPU outside Vulkan
+// AMD's DLL picks among its FSR 4.1.2 providers by asking the device itself (vkGetPhysicalDeviceProperties2,
+// vkEnumerateDeviceExtensionProperties, vkGetPhysicalDeviceFeatures2, imported from vulkan-1.dll, not through the device's
+// functions the harness hands it) and, for its INT8 providers, the GPU's family and revision from AMD's Windows kernel
+// driver (D3DKMTQueryAdapterInfo, KMTQAITYPE_UMDRIVERPRIVATE, found with GetProcAddress in gdi32.dll), which Wine does
+// not have. To trace those providers, the harness can answer for the driver and hide extensions, by pointing the DLL's
+// import table (in memory, after loading it: the file is not touched, no code is changed) at the functions below:
+//   TRACE_AMD_FAMILY=n TRACE_AMD_REV=n   the family and revision the "kernel driver" reports (e.g. 0x91 0x01 for Navi 31)
+//   TRACE_HIDE_EXT=name,...              device extensions the DLL's own enumeration does not see (VK_KHR_cooperative_matrix:
+//                                        no FP8 provider, so the INT8 one is taken on an RDNA 4 GPU)
+namespace spoof {
+static std::string g_hide;
+static long g_family = -1, g_rev = 0;
+static PFN_vkEnumerateDeviceExtensionProperties real_enum;
+static FARPROC(WINAPI* real_gpa)(HMODULE, LPCSTR);
+
+static VkResult VKAPI_CALL enum_ext(VkPhysicalDevice p, const char* layer, uint32_t* n, VkExtensionProperties* out) {
+    uint32_t all = 0;
+    if (VkResult r = real_enum(p, layer, &all, nullptr)) return r;
+    std::vector<VkExtensionProperties> e(all);
+    real_enum(p, layer, &all, e.data());
+    e.resize(all);
+    e.erase(std::remove_if(e.begin(), e.end(), [](const VkExtensionProperties& x) {
+                return g_hide.find(std::string(",") + x.extensionName + ",") != std::string::npos;
+            }), e.end());
+    if (!out) return *n = (uint32_t)e.size(), VK_SUCCESS;
+    const uint32_t k = std::min<uint32_t>(*n, (uint32_t)e.size());
+    std::copy(e.begin(), e.begin() + k, out);
+    *n = k;
+    return k < e.size() ? VK_INCOMPLETE : VK_SUCCESS;
+}
+// (the layouts of d3dkmthk.h: D3DKMT_ENUMADAPTERS, D3DKMT_QUERYADAPTERINFO)
+struct KmtAdapter { UINT handle; LUID luid; ULONG sources; BOOL precise; };
+struct KmtEnum { ULONG count; KmtAdapter adapters[16]; };
+struct KmtQuery { UINT adapter; UINT type; void* data; UINT size; };
+static LONG APIENTRY kmt_enum(KmtEnum* e) {
+    memset(e, 0, sizeof *e);
+    e->count = 1, e->adapters[0].handle = 0x40000040u, e->adapters[0].sources = 1;
+    logf("SPOOF D3DKMTEnumAdapters: one adapter");
+    return 0;
+}
+static LONG APIENTRY kmt_query(KmtQuery* q) {
+    // (AMD's private data in its first, short form: the family at +0x30, the revision at +0x34; traced in the DLL's reading)
+    if (q->type != 0 || q->size < 0x38) return (LONG)0xc000000du;   // STATUS_INVALID_PARAMETER
+    memset(q->data, 0, q->size);
+    ((uint32_t*)q->data)[0x30 / 4] = (uint32_t)g_family, ((uint32_t*)q->data)[0x34 / 4] = (uint32_t)g_rev;
+    logf("SPOOF D3DKMTQueryAdapterInfo type=%u size=%u: family=0x%lx revision=0x%lx", q->type, q->size, g_family, g_rev);
+    return 0;
+}
+static FARPROC WINAPI gpa(HMODULE m, LPCSTR name) {
+    if ((uintptr_t)name > 0xffff && g_family >= 0) {
+        if (!strcmp(name, "D3DKMTEnumAdapters")) return (FARPROC)kmt_enum;
+        if (!strcmp(name, "D3DKMTQueryAdapterInfo")) return (FARPROC)kmt_query;
+    }
+    return real_gpa(m, name);
+}
+/// points the import of <dll>!<name> of the loaded module at f; returns what it pointed at
+static void* patch_import(void* module, const char* dll, const char* name, void* f) {
+    uint8_t* base = (uint8_t*)module;
+    auto* nt = (IMAGE_NT_HEADERS64*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
+    const IMAGE_DATA_DIRECTORY dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    for (auto* d = (IMAGE_IMPORT_DESCRIPTOR*)(base + dir.VirtualAddress); d->Name; d++) {
+        if (_stricmp((const char*)(base + d->Name), dll)) continue;
+        auto* names = (IMAGE_THUNK_DATA64*)(base + d->OriginalFirstThunk);
+        auto* iat = (IMAGE_THUNK_DATA64*)(base + d->FirstThunk);
+        for (; names->u1.AddressOfData; names++, iat++) {
+            if (IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal)) continue;
+            if (strcmp((const char*)((IMAGE_IMPORT_BY_NAME*)(base + names->u1.AddressOfData))->Name, name)) continue;
+            DWORD old;
+            VirtualProtect(&iat->u1.Function, 8, PAGE_READWRITE, &old);
+            void* was = (void*)iat->u1.Function;
+            iat->u1.Function = (ULONGLONG)f;
+            VirtualProtect(&iat->u1.Function, 8, old, &old);
+            return was;
+        }
+    }
+    die("spoof: %s!%s is not imported", dll, name);
+}
+static void install(void* module) {
+    if (const char* f = getenv("TRACE_AMD_FAMILY")) {
+        g_family = strtol(f, nullptr, 0), g_rev = getenv("TRACE_AMD_REV") ? strtol(getenv("TRACE_AMD_REV"), nullptr, 0) : 0;
+        real_gpa = (FARPROC(WINAPI*)(HMODULE, LPCSTR))patch_import(module, "KERNEL32.dll", "GetProcAddress", (void*)gpa);
+        logf("spoof: the kernel driver reports family 0x%lx revision 0x%lx", g_family, g_rev);
+    }
+    if (const char* h = getenv("TRACE_HIDE_EXT")) {
+        g_hide = std::string(",") + h + ",";
+        real_enum = (PFN_vkEnumerateDeviceExtensionProperties)patch_import(module, "vulkan-1.dll", "vkEnumerateDeviceExtensionProperties", (void*)enum_ext);
+        logf("spoof: device extensions hidden from the provider: %s", h);
+    }
+}
+} // namespace spoof
+#endif
+
 int main(int argc, char** argv) {
     if (argc < 3) die("usage: trace <provider library> <out dir> [W H RW RH frames dumpFrom]");
     g_out = argv[2];
@@ -1221,6 +1315,9 @@ int main(int argc, char** argv) {
     // ---- the provider
     void* lib = load_lib(argv[1]);
     if (!lib) die("%s did not load", argv[1]);
+#ifdef _WIN32
+    spoof::install(lib);
+#endif
     auto create = (PfnFfxCreateContext)sym(lib, "ffxCreateContext");
     auto destroy = (PfnFfxDestroyContext)sym(lib, "ffxDestroyContext");
     auto configure = (PfnFfxConfigure)sym(lib, "ffxConfigure");

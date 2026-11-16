@@ -1,5 +1,5 @@
 """Builds the native library's assets from AMD's upscaler DLL (FSR SDK 2.4.0, FSR 4.1.2): the SPIR-V modules the port uses,
-taken out of the zlib streams they are stored in, and the network's initializer buffer. The DLL is read as data only.
+taken out of the zlib streams they are stored in, and the networks' initializer buffers (FP8 and the three INT8 ones). The DLL is read as data only.
 
     python3 -I tools/setup.py --dll /path/to/amd_fidelityfx_upscaler_vk.dll [--out build/gen]
 
@@ -15,7 +15,19 @@ from reflect import reflect, RESOURCES, KINDS
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL = json.load(open(os.path.join(ROOT, 'data', 'model.json')))
 MODEL_PASSES = ['pass0_post'] + ['pass%d%s' % (i, s) for i in range(1, 13) for s in ('', '_post')]   # (25, in dispatch order)
+INT8 = ['i8', 'i8_navi2', 'lite']   # (data/model.json int8.<name>: AMD's FSR4-i8, FSR4-i8-2 and FSR4L-i8)
 EXTRA = ['spd', 'rcas_219', 'rcas_220', 'rcas_222', 'rcas_223', 'rcas_225', 'debug', 'debug_b', 'watermark']
+
+# the SPIR-V capabilities AMD's network passes declare, by number, and the name the library checks the device for each by
+CAPS = {1: 'SHADER', 9: 'FLOAT16', 22: 'INT16', 39: 'INT8', 49: 'IMAGE_EXTENDED_FORMATS', 56: 'IMAGE_WRITE_WITHOUT_FORMAT', 61: 'GROUP_NON_UNIFORM',
+        68: 'IMAGE_QUERY', 4212: 'FLOAT8', 4213: 'FLOAT8_COOPERATIVE_MATRIX', 4433: 'STORAGE_BUFFER_16BIT', 4441: 'VARIABLE_POINTERS_STORAGE_BUFFER', 4442: 'VARIABLE_POINTERS',
+        5345: 'VULKAN_MEMORY_MODEL', 5350: 'DERIVATIVE_GROUP_LINEAR', 5431: 'COOPERATIVE_MATRIX_CONVERSIONS_NV', 6018: 'DOT_PRODUCT_4X8_PACKED',
+        6019: 'DOT_PRODUCT', 6022: 'COOPERATIVE_MATRIX'}
+
+
+def capabilities(blob):
+    from reflect import instructions
+    return {a[0] for op, a in instructions(blob) if op == 17}
 
 
 def main():
@@ -27,20 +39,32 @@ def main():
     if hashlib.sha256(d).hexdigest() != MODEL['dll_sha256']:
         raise SystemExit('not the DLL this was made for: amd_fidelityfx_upscaler_vk.dll of FSR SDK 2.4.0, %s (SHA-256 %s)'
                          % (MODEL['version'], MODEL['dll_sha256']))
-    inits = []
-    for k in ('initializer', 'initializer_ultra'):   # (the network's two presets: AMD's DLL picks by the upscale ratio)
-        i = MODEL[k]
+    def init_blob(i, what):
         blob = d[i['offset']:i['offset'] + i['size']]
-        if hashlib.sha256(blob).hexdigest() != i['sha256']: raise SystemExit('the %s buffer is not where it was' % k)
-        inits.append(blob)
+        if hashlib.sha256(blob).hexdigest() != i['sha256']: raise SystemExit('the %s buffer is not where it was' % what)
+        return blob
+
+    # the networks: FP8 (the top level of data/model.json) and the INT8 ones (int8.<name>), each with its size buckets, a
+    # standard and an ultra performance preset each (FP8's are the same passes), and its two initializer buffers
+    nets = [{'name': 'fp8', 'amd_name': 'FSR4', 'tensor_shift': MODEL['tensor_shift'],
+             'inits': [init_blob(MODEL[k], k) for k in ('initializer', 'initializer_ultra')],
+             'buckets': [dict(b, presets=[{'model': b['model'], 'groups': MODEL['groups'], 'prepass': b['prepass'], 'postpass': b['postpass']}] * 2,
+                              scratch=MODEL['scratch'][b['name']]) for b in MODEL['buckets']]}]
+    for n in INT8:
+        net = MODEL['int8'][n]
+        nets.append({'name': n, 'amd_name': net['amd_name'], 'tensor_shift': net['tensor_shift'],
+                     'inits': [init_blob(net[k], n + ' ' + k) for k in ('initializer', 'initializer_ultra')],
+                     'buckets': [dict(b, presets=[b['standard'], b['ultra']]) for b in net['buckets']]})
     by_sha = {}
     for off, csize, blob in streams(d):
         by_sha.setdefault(hashlib.sha256(blob).hexdigest()[:16], blob)
 
-    want = []   # every module the tables name, once, in a stable order
-    for b in MODEL['buckets']:
-        want += b['model'] + b['prepass'] + b['postpass']
-    want += [MODEL['extra'][k] for k in EXTRA]
+    want = []   # every module the tables name, once, in a stable order (FP8's first, as before INT8 was added)
+    for net in nets:
+        for b in net['buckets']:
+            for p in b['presets']:
+                want += p['model'] + p['prepass'] + p['postpass']
+        if net['name'] == 'fp8': want += [MODEL['extra'][k] for k in EXTRA]
     order = list(dict.fromkeys(want))
     missing = [s for s in order if s not in by_sha]
     if missing: raise SystemExit('modules not found in the DLL: ' + ', '.join(missing))
@@ -74,23 +98,47 @@ def main():
         number[sha] = n
     out.append('};')
     out.append('')
-    out.append('// the size buckets: the largest display size of each, AMD\'s scratch buffer size, the 25 network passes in')
-    out.append('// order (pass0_post, pass1, pass1_post, ... pass12_post), and the prepass and postpass by flags (see prepass_key()')
-    out.append('// and postpass_key() in fsr4up.cpp)')
-    out.append('struct GenBucket { uint32_t max_w, max_h; uint64_t scratch; uint16_t model[25]; uint16_t prepass[128]; uint16_t postpass[32]; };')
-    out.append('static const GenBucket GEN_BUCKETS[3] = {')
-    for b in MODEL['buckets']:
-        out.append('    {%d, %d, %dull, {%s},\n     {%s},\n     {%s}},' % (
-            b['max'][0], b['max'][1], MODEL['scratch'][b['name']], ', '.join(str(number[s]) for s in b['model']),
-            ', '.join(str(number[s]) for s in b['prepass']), ', '.join(str(number[s]) for s in b['postpass'])))
+    out.append('// a pass\'s groups: {s, a, b} for (ceil((W8 >> s) / a), ceil((H8 >> s) / b)), W8 and H8 the display size rounded up to 8;')
+    out.append('// s = 255: a border pass, whose count its module gives (post_groups())')
+    out.append('struct GenGroups { uint16_t s, a, b; };')
+    out.append('// a preset of a size bucket: the network\'s passes in order, the groups of the prepass, each of those and the postpass,')
+    out.append('// and the prepass and postpass by flags (see prepass_key() and postpass_key() in fsr4up.cpp)')
+    out.append('struct GenPreset { uint16_t model[25]; GenGroups groups[27]; uint16_t prepass[128]; uint16_t postpass[32]; };')
+    out.append('// a size bucket: the largest display size of it, AMD\'s scratch buffer size, the standard and ultra performance presets')
+    out.append('struct GenBucket { uint32_t max_w, max_h; uint64_t scratch; GenPreset preset[2]; };')
+    out.append('// a network: AMD\'s name of it, how many passes it has between the prepass and postpass, its tensors (CsTensorSizes) by')
+    out.append('// level, the initializer buffers of its standard and ultra performance presets')
+    out.append('// caps: what the SPIR-V of its passes declares (OpCapability), as CAP_ bits')
+    out.append('enum GenCap : uint32_t { %s };' % ', '.join('CAP_%s = 1u << %d' % (n, i) for i, n in enumerate(CAPS.values())))
+    out.append('struct GenNet { const char* name; const char* amd_name; uint8_t passes, tensors; uint8_t tensor_shift[17]; '
+               'uint32_t init_offset[2], init_size; uint32_t caps; GenBucket buckets[3]; };')
+    out.append('enum GenNetId : uint8_t { %s, NET_COUNT };' % ', '.join('NET_' + n['name'].upper() for n in nets))
+    out.append('static const GenNet GEN_NETS[NET_COUNT] = {')
+    for net in nets:
+        i0, i1 = add(net['inits'][0]), add(net['inits'][1])
+        if i0[1] != i1[1]: raise SystemExit('the two initializer buffers of %s differ in size' % net['name'])
+        caps = set()
+        for bk in net['buckets']:
+            for p in bk['presets']:
+                for sha in p['model'] + p['prepass'] + p['postpass']: caps |= capabilities(by_sha[sha])
+        if caps - set(CAPS): raise SystemExit('%s: capabilities this library does not know: %s' % (net['name'], sorted(caps - set(CAPS))))
+        out.append('  {"%s", "%s", %d, %d, {%s}, {%d, %d}, %d, %s, {' % (net['name'], net['amd_name'], len(net['buckets'][0]['presets'][0]['model']),
+                   len(net['tensor_shift']), ', '.join(map(str, net['tensor_shift'])), i0[0], i1[0], i0[1],
+                   ' | '.join('CAP_' + CAPS[c] for c in sorted(caps))))
+        for bk in net['buckets']:
+            out.append('    {%d, %d, %dull, {' % (bk['max'][0], bk['max'][1], bk['scratch']))
+            for p in bk['presets']:
+                if len(p['model']) != len(net['buckets'][0]['presets'][0]['model']) or len(p['groups']) != len(p['model']) + 2:
+                    raise SystemExit('%s %s: the passes do not match' % (net['name'], bk['name']))
+                g = ', '.join('{255, 0, 0}' if x == 'post' else '{%d, %d, %d}' % tuple(x) for x in p['groups'])
+                out.append('      {{%s},\n       {%s},\n       {%s},\n       {%s}},' % (
+                    ', '.join(str(number[s]) for s in p['model']), g, ', '.join(str(number[s]) for s in p['prepass']),
+                    ', '.join(str(number[s]) for s in p['postpass'])))
+            out.append('    }},')
+        out.append('  }},')
     out.append('};')
     for k in EXTRA:
         out.append('static const uint16_t GEN_%s = %d;' % (k.upper(), number[MODEL['extra'][k]]))
-    io, isz = add(inits[0])
-    uo, usz = add(inits[1])
-    if usz != isz: raise SystemExit('the two initializer buffers differ in size')
-    out.append('// the initializer buffer of the standard preset, and of ultra performance (see initialise() in fsr4up.cpp)')
-    out.append('static const uint32_t GEN_INIT_OFFSET = %d, GEN_INIT_ULTRA_OFFSET = %d, GEN_INIT_SIZE = %d;' % (io, uo, isz))
     os.makedirs(a.out, exist_ok=True)
     open(os.path.join(a.out, 'assets_gen.h'), 'w').write('\n'.join(out) + '\n')
     open(os.path.join(a.out, 'assets.bin'), 'wb').write(pack)

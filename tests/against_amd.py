@@ -5,7 +5,10 @@ harness's fault, not the port's, and also fails. Every API result the harness lo
 dispatch, destroy) is compared as well, but for GET_VERSIONS (AMD's DLL also offers FSR 3.1.6 and 2.3.4, which this
 library does not implement).
 
-    python3 -I tests/against_amd.py [-k substring ...] [--list] [--refresh-amd] [--keep] [--build DIR] [--re DIR]
+The INT8 cases (int8_<network>_<case>) run AMD's DLL down its INT8 networks (INT8 below: the harness stands in for AMD's
+kernel driver) and the port with FSR4UP_INT8=<network>.
+
+    python3 -I tests/against_amd.py [-k substring ...] [--list] [--refresh-amd] [--keep] [--build DIR] [--re DIR] [--gpu NAME]
 
 AMD's results are cached as SHA-256 hashes per image in <re>/suite/amd/<case>.json, keyed by the case, the harness source
 and AMD's DLL, so AMD only runs again when one of those changes (or with --refresh-amd). The raw images are deleted after
@@ -114,7 +117,32 @@ def cases():
     case('upscale_smaller_ultra', 3, TRACE_MAX='640,360', TRACE_RENDER_W='640,640,640', TRACE_RENDER_H='360,360,360', TRACE_UPSCALE_W='1920,1900,1916',
          TRACE_UPSCALE_H='1080,1080,1080')
     case('sharpen_toggle', 5, TRACE_SHARPNESS='0.5,0.5,0.2,0.8,0.8', TRACE_SHARPEN_ON='0,1,1,0,1')
+    # The INT8 networks: AMD's DLL made to take them (see INT8), the port told to (FSR4UP_INT8), on a representative set:
+    # the three size buckets with both presets, and the flags that pick other prepasses and postpasses or start over
+    # (FSR4-i8's and FSR4-Lite's prepasses give other results from run to run at an odd display width or height, in
+    # AMD's DLL as in the port, even with the GPU's memory zeroed (traced: the scratch buffer after the prepass differs):
+    # they are compared at even sizes only, FSR4-i8-2's at 1001x777 too)
+    out['1002x778_quality_moving'] = (1002, 778) + render_size(1002, 778, 1.5) + (4, dict(mv))
+    for net, spoof in INT8.items():
+        for n in INT8_CASES + (['1001x777_quality_moving'] if net == 'navi2' else []):
+            w, h, rw, rh, frames, env = out[n]
+            out['int8_%s_%s' % (net, n)] = (w, h, rw, rh, frames, dict(env, **spoof, FSR4UP_INT8=net))
+    del out['1002x778_quality_moving']
     return out
+
+
+# AMD's DLL offers its INT8 networks by the GPU's family and revision from its Windows kernel driver, which Wine has not:
+# the harness answers for that driver (TRACE_AMD_FAMILY, TRACE_AMD_REV: a GPU each network is AMD's choice for), and hides
+# VK_KHR_cooperative_matrix from the DLL, whose FP8 network would come first (harness/trace.cpp, spoof)
+INT8 = {net: {'TRACE_AMD_FAMILY': fam, 'TRACE_AMD_REV': rev, 'TRACE_HIDE_EXT': 'VK_KHR_cooperative_matrix'}
+        for net, fam, rev in (('i8', '0x91', '0x01'), ('navi2', '0x8f', '0x28'), ('lite', '0x90', '0x01'))}
+_B = '1920x1080_quality_moving'
+INT8_CASES = ['1280x720_quality_still', '1280x720_performance_moving', '1002x778_quality_moving', _B, '1920x1080_ultraperformance_moving',
+              '2560x1440_quality_moving', '3840x2160_performance_still', '3840x2160_ultraperformance_moving', '1080x1920_quality_moving',
+              '5120x2880_quality_moving', '5120x2880_ultraperformance_moving'] + [_B + '_' + x for x in (
+    'reset3', 'depth_std_finite', 'jittercancel', 'displaymv', 'autoexposure', 'exposure_texture', 'preexposure', 'hdr', 'nonlinear',
+    'nonlinear_autoexposure', 'srgb', 'pq', 'srgb_autoexposure', 'srgb_switch', 'debugvis', 'debugview', 'sharpen05', 'sharpen_srgb',
+    'dynamic', 'upscale_smaller', 'ultra_switch', 'ultra_switch_dynamic', 'format_rgba8', 'long')]
 
 
 def sha_file(path):
@@ -195,8 +223,10 @@ def main():
     ap.add_argument('--keep', action='store_true', help='keep the raw images of passing cases')
     ap.add_argument('--build', default=os.environ.get('FSR4UP_BUILD', os.path.join(ROOT, 'build')))
     ap.add_argument('--re', default=os.environ.get('FSR4UP_RE', os.path.join(ROOT, 're')))
+    ap.add_argument('--gpu', help='the GPU to run on, by a part of its name (TRACE_GPU; default: the first discrete one). '
+                    'Its results are cached apart: <re>/suite-<gpu>/')
     a = ap.parse_args()
-    build, suite = os.path.abspath(a.build), os.path.join(os.path.abspath(a.re), 'suite')
+    build, suite = os.path.abspath(a.build), os.path.join(os.path.abspath(a.re), 'suite' + ('-' + re.sub(r'\W', '_', a.gpu) if a.gpu else ''))
     todo = {n: c for n, c in cases().items() if not a.k or any(k in n for k in a.k)}
     if a.list:
         for n, c in todo.items(): print(n, *c)
@@ -211,8 +241,9 @@ def main():
         racy = cenv.get('_RACY') == 1 or cenv.get('_RACY') == '1'
         cenv = {k: v for k, v in cenv.items() if not k.startswith('_')}
         args = [str(x) for x in (w, h, rw, rh, frames, 0)]
-        env = {k: v for k, v in os.environ.items() if not k.startswith('TRACE_')}
+        env = {k: v for k, v in os.environ.items() if not k.startswith('TRACE_') and k != 'FSR4UP_INT8'}
         env.update(cenv, TRACE_DUMP_ALL='')
+        if a.gpu: env['TRACE_GPU'] = a.gpu
         key = amd_key(build, case)
         cache = os.path.join(suite, 'amd', name + '.json')
         amd = json.load(open(cache)) if os.path.exists(cache) and not a.refresh_amd else None
@@ -271,6 +302,8 @@ def main():
                                          'preexposure', 'nonlinear', 'srgb', 'pq', 'sharpen05', 'debugview')]
     # (FSR 4 makes the same frames with finite and infinite depth (traced): only inverted or not is compared)
     groups += [[B + '_depth_std_finite', B + '_depth_inv_finite'], [B + '_sharpen0', B + '_sharpen05', B + '_sharpen1']]
+    # (and the INT8 networks must make frames of their own, or AMD's DLL or the port ran another network)
+    groups += [[B] + ['int8_%s_%s' % (n, B) for n in INT8], ['1920x1080_ultraperformance_moving'] + ['int8_%s_1920x1080_ultraperformance_moving' % n for n in INT8]]
     for g in groups:
         if not all(n in todo for n in g): continue
         fr = [outs(n) for n in g]

@@ -9,7 +9,7 @@ build = os.path.abspath(sys.argv[1])
 bad = 0
 for name in sys.argv[2:]:
     w, h, rw, rh, frames, cenv = cases[name]
-    env = {k: v for k, v in os.environ.items() if not k.startswith('TRACE_')}
+    env = {k: v for k, v in os.environ.items() if not k.startswith('TRACE_') and k != 'FSR4UP_INT8'}
     env.update({k: v for k, v in cenv.items() if not k.startswith('_')}, TRACE_DUMP_ALL='')
     out = os.path.join(ROOT, 're', 'rerun', name)
     os.makedirs(os.path.dirname(out), exist_ok=True)

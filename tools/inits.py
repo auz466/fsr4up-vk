@@ -7,6 +7,6 @@ D = Dll(); run = sys.argv[1]; frame = None; out = []
 for line in open(os.path.join(run, 'trace.log')):
     m = re.match(r'=== FRAME (\d+)', line)
     if m: frame = m.group(1)
-    m = re.match(r'CopyBuffer \S+ -> \S+ size=131072 file=(\S+)', line)
-    if m: out.append('f%s:%s' % (frame, hex(D.d.find(open(os.path.join(run, m.group(1)), 'rb').read()))))
+    m = re.match(r'CopyBuffer \S+ -> \S+ size=(\d+) file=(\S+)', line)   # (128 KiB; 27,392 bytes for FSR4-Lite)
+    if m and int(m.group(1)) >= 16384: out.append('f%s:%s' % (frame, hex(D.d.find(open(os.path.join(run, m.group(2)), 'rb').read()))))
 print(' '.join(out))
