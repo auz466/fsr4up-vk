@@ -128,4 +128,4 @@ See `HOW_IT_WAS_MADE.md` for the method, and `THIRD_PARTY_NOTICES.md` for AMD's 
 
 ## Licence
 
-Not chosen yet.
+MIT, see `LICENSE` (this repository's own code). AMD's headers in `third_party/` and the data a build takes from AMD's DLL stay under AMD's MIT licence; see `THIRD_PARTY_NOTICES.md`.
